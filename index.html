@@ -133,6 +133,76 @@
 
     .muted { color: var(--muted); }
     .err { color: var(--bad); font-size: 13px; margin-top: 8px; min-height: 18px; }
+
+    /* ---------------- Live Call ---------------- */
+    .live-grid { display: grid; grid-template-columns: 260px 1fr; gap: 20px; }
+    @media (max-width: 860px) { .live-grid { grid-template-columns: 1fr; } }
+
+    .meter { margin-bottom: 16px; }
+    .meter-label {
+      color: var(--muted); font-size: 11px; text-transform: uppercase;
+      letter-spacing: .8px; margin-bottom: 6px;
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .meter-label .val { font-family: ui-monospace, monospace; color: var(--ink); font-size: 13px; }
+    .gauge {
+      height: 8px; background: #0e111a;
+      border: 1px solid var(--line); border-radius: 999px; overflow: hidden;
+    }
+    .gauge-fill {
+      height: 100%; width: 0%;
+      background: var(--accent);
+      transition: width .35s cubic-bezier(.2,.8,.2,1), background-color .35s ease;
+    }
+
+    .tone-pill {
+      display: inline-block; padding: 5px 12px; border-radius: 999px;
+      font-size: 12px; font-weight: 700; letter-spacing: .6px;
+      text-transform: uppercase;
+    }
+    .tone-pill.t-neutral  { background: #232838; color: var(--muted); }
+    .tone-pill.t-soft     { background: #1c2d4a; color: var(--accent); }
+    .tone-pill.t-discount { background: #3a2f14; color: var(--warn); }
+    .tone-pill.t-close    { background: #133622; color: var(--ok); }
+
+    .chat {
+      max-height: 420px; min-height: 220px; overflow-y: auto;
+      padding: 14px; background: var(--card2);
+      border: 1px solid var(--line); border-radius: 10px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .chat .sys, .chat .empty {
+      color: var(--muted); text-align: center; padding: 14px; font-size: 13px;
+    }
+    .bubble {
+      max-width: 82%; padding: 9px 13px; border-radius: 14px;
+      font-size: 14px; line-height: 1.45; word-wrap: break-word;
+    }
+    .bubble .meta {
+      font-size: 10px; color: var(--muted); margin-bottom: 3px;
+      letter-spacing: .7px; text-transform: uppercase;
+    }
+    .bubble.user   { align-self: flex-end;   background: #1f2640; }
+    .bubble.agent  { align-self: flex-start; background: #132a1f; border: 1px solid #1f4733; }
+    .bubble.interim { opacity: .55; font-style: italic; }
+    .bubble.agent.barged { text-decoration: line-through; opacity: .55; }
+
+    .banner {
+      align-self: stretch; text-align: center; padding: 10px 14px;
+      border-radius: 10px; font-weight: 600; font-size: 13px;
+    }
+    .banner.p-purchased  { background: #133622; color: var(--ok); }
+    .banner.p-postponed  { background: #3a2f14; color: var(--warn); }
+    .banner.p-cancelled  { background: #3a1f23; color: var(--bad); }
+    .banner.p-interested { background: #1c2d4a; color: var(--accent); }
+    .banner.p-undecided, .banner.p-no_answer { background: #232838; color: var(--muted); }
+
+    .live-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: #555; margin-right: 6px; vertical-align: middle;
+    }
+    .live-dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   </style>
 </head>
 <body>
@@ -174,6 +244,39 @@
         <ul class="queue" id="serverQueue"><li class="muted">—</li></ul>
       </section>
     </div>
+
+    <section class="card" style="margin-top: 20px;">
+      <h2>
+        <span id="liveDot" class="live-dot"></span>
+        Live Call <span id="liveHint" class="muted" style="text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 6px;">— connecting…</span>
+      </h2>
+      <div class="live-grid">
+        <div class="meters">
+          <div class="meter">
+            <div class="meter-label"><span>Tone</span></div>
+            <span id="toneBadge" class="tone-pill t-neutral">neutral</span>
+          </div>
+          <div class="meter">
+            <div class="meter-label"><span>Interest</span><span class="val" id="interestVal">0.00</span></div>
+            <div class="gauge"><div id="interestBar" class="gauge-fill"></div></div>
+          </div>
+          <div class="meter">
+            <div class="meter-label"><span>Sentiment</span><span class="val" id="sentVal">0.00</span></div>
+            <div class="gauge"><div id="sentBar" class="gauge-fill"></div></div>
+          </div>
+          <div class="meter">
+            <div class="meter-label"><span>Frustration</span><span class="val" id="frustVal">0</span></div>
+            <div class="gauge"><div id="frustBar" class="gauge-fill"></div></div>
+          </div>
+          <div class="meter">
+            <div class="meter-label"><span>Turns</span><span class="val" id="turnsVal">0</span></div>
+          </div>
+        </div>
+        <div class="chat" id="chat">
+          <div class="empty">Waiting for a call…</div>
+        </div>
+      </div>
+    </section>
 
     <section class="card" style="margin-top: 20px;">
       <h2>Recent Calls</h2>
@@ -259,7 +362,174 @@
     pollHistory();
     setInterval(pollStatus, 1500);
     setInterval(pollHistory, 3000);
+    connectLive();
   });
+
+  // ============================================================
+  // Live transcript + sentiment meter  (WebSocket → /live)
+  // ============================================================
+  let liveWs = null;
+  let interimBubble = null;
+  let lastAgentBubble = null;
+
+  function connectLive() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    try { liveWs && liveWs.close(); } catch {}
+    liveWs = new WebSocket(proto + "//" + location.host + "/live");
+    liveWs.onopen = () => {
+      $("liveDot").classList.add("on");
+      $("liveHint").textContent = "— waiting for events";
+    };
+    liveWs.onmessage = (ev) => {
+      try { handleLiveEvent(JSON.parse(ev.data)); } catch (e) { console.warn(e); }
+    };
+    liveWs.onclose = () => {
+      $("liveDot").classList.remove("on");
+      $("liveHint").textContent = "— reconnecting…";
+      setTimeout(connectLive, 2000);
+    };
+    liveWs.onerror = () => { try { liveWs.close(); } catch {} };
+  }
+
+  function handleLiveEvent(e) {
+    switch (e.type) {
+      case "call_start":  onCallStart(e);   break;
+      case "user_interim": onUserInterim(e); break;
+      case "user_final":  onUserFinal(e);   break;
+      case "agent_speak": onAgentSpeak(e);  break;
+      case "state":       onState(e);       break;
+      case "barge_in":    onBargeIn();      break;
+      case "call_end":    onCallEnd(e);     break;
+    }
+  }
+
+  function onCallStart(e) {
+    clearChat();
+    resetMeters();
+    $("liveHint").textContent = "— in progress · " + (e.phone || "");
+    addSys(`Connected to ${e.phone || "unknown"}`);
+  }
+
+  function onUserInterim(e) {
+    const chat = $("chat");
+    if (!interimBubble) {
+      clearIfEmpty();
+      interimBubble = document.createElement("div");
+      interimBubble.className = "bubble user interim";
+      interimBubble.innerHTML = `<div class="meta">user · speaking</div><div class="txt"></div>`;
+      chat.appendChild(interimBubble);
+    }
+    interimBubble.querySelector(".txt").textContent = e.text;
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function onUserFinal(e) {
+    clearIfEmpty();
+    if (interimBubble) {
+      interimBubble.classList.remove("interim");
+      interimBubble.querySelector(".meta").textContent = "user";
+      interimBubble.querySelector(".txt").textContent = e.text;
+      interimBubble = null;
+    } else {
+      const b = document.createElement("div");
+      b.className = "bubble user";
+      b.innerHTML = `<div class="meta">user</div><div class="txt"></div>`;
+      b.querySelector(".txt").textContent = e.text;
+      $("chat").appendChild(b);
+    }
+    scrollChat();
+  }
+
+  function onAgentSpeak(e) {
+    clearIfEmpty();
+    const b = document.createElement("div");
+    b.className = "bubble agent";
+    b.innerHTML = `<div class="meta">agent · ${escape(e.tone || "neutral")}</div><div class="txt"></div>`;
+    b.querySelector(".txt").textContent = e.text;
+    $("chat").appendChild(b);
+    lastAgentBubble = b;
+    scrollChat();
+  }
+
+  function onBargeIn() {
+    if (lastAgentBubble) lastAgentBubble.classList.add("barged");
+  }
+
+  function onState(e) {
+    // tone badge
+    const tb = $("toneBadge");
+    tb.textContent = e.tone;
+    tb.className = "tone-pill t-" + e.tone;
+
+    // interest: typical range roughly -3..+8
+    setGauge("interestBar", "interestVal", e.interest, -3, 8, {
+      neg: "#f87171", low: "#6ea8ff", mid: "#fbbf24", hi: "#4ade80",
+    });
+    // sentiment: -1..+1
+    setGauge("sentBar", "sentVal", e.sentiment, -1, 1, {
+      neg: "#f87171", low: "#6ea8ff", mid: "#fbbf24", hi: "#4ade80",
+    });
+    // frustration: 0..5
+    setGauge("frustBar", "frustVal", e.frustration, 0, 5, {
+      neg: "#4ade80", low: "#4ade80", mid: "#fbbf24", hi: "#f87171",
+    }, /*int=*/true);
+
+    $("turnsVal").textContent = e.turns ?? 0;
+  }
+
+  function onCallEnd(e) {
+    const b = document.createElement("div");
+    b.className = "banner p-" + (e.outcome || "undecided");
+    const dur = e.duration_sec != null ? `${Number(e.duration_sec).toFixed(1)}s · ` : "";
+    b.textContent = `Call ended — ${e.outcome} · ${dur}${e.notes || ""}`;
+    $("chat").appendChild(b);
+    scrollChat();
+    $("liveHint").textContent = "— idle";
+    interimBubble = null;
+    lastAgentBubble = null;
+  }
+
+  // ---- helpers ----
+  function setGauge(barId, valId, value, lo, hi, colors, asInt = false) {
+    const pct = Math.max(0, Math.min(100, ((value - lo) / (hi - lo)) * 100));
+    const bar = $(barId);
+    bar.style.width = pct + "%";
+    let c = colors.low;
+    if (value < 0) c = colors.neg;
+    else if (pct > 70) c = colors.hi;
+    else if (pct > 35) c = colors.mid;
+    bar.style.background = c;
+    $(valId).textContent = asInt ? String(value) : Number(value).toFixed(2);
+  }
+
+  function resetMeters() {
+    onState({ tone: "neutral", interest: 0, sentiment: 0, frustration: 0, turns: 0 });
+  }
+
+  function clearChat() {
+    $("chat").innerHTML = "";
+    interimBubble = null;
+    lastAgentBubble = null;
+  }
+
+  function clearIfEmpty() {
+    const empty = $("chat").querySelector(".empty");
+    if (empty) empty.remove();
+  }
+
+  function addSys(text) {
+    clearIfEmpty();
+    const d = document.createElement("div");
+    d.className = "sys";
+    d.textContent = text;
+    $("chat").appendChild(d);
+    scrollChat();
+  }
+
+  function scrollChat() {
+    const c = $("chat");
+    c.scrollTop = c.scrollHeight;
+  }
 
   // ---------------- actions ----------------
   async function startCalls() {

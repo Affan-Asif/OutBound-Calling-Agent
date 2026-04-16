@@ -172,6 +172,26 @@ DB = _open_db()
 print(f"💾 calls DB: {DB_PATH}")
 
 
+# ========================================================================
+# Live event broadcaster — /live WebSocket fans out transcripts, tone,
+# and sentiment updates to the frontend during a call.
+# ========================================================================
+LIVE_CLIENTS: set[WebSocket] = set()
+
+async def live_broadcast(event: dict):
+    """Fire-and-forget push to every connected /live client."""
+    event.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    msg = json.dumps(event, ensure_ascii=False)
+    dead = []
+    for ws in list(LIVE_CLIENTS):
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        LIVE_CLIENTS.discard(ws)
+
+
 async def save_outcome(row: dict) -> int:
     """Insert a call outcome row, returns the new id."""
     def _write() -> int:
@@ -588,6 +608,16 @@ class Session:
             f"frustration={self.state['frustration']}  "
             f"sent={self.state['sentiment']:+.2f}"
         )
+        # Push the state to the live UI as soon as it's decided — lets the
+        # meter + tone badge animate while we're still waiting for Gemini.
+        await live_broadcast({
+            "type":        "state",
+            "tone":        self.tone,
+            "interest":    round(self.state["interest"], 3),
+            "frustration": self.state["frustration"],
+            "sentiment":   round(self.state["sentiment"], 3),
+            "turns":       self.state["turns"],
+        })
 
         reply = None
         now = asyncio.get_event_loop().time()
@@ -625,6 +655,9 @@ class Session:
 
         self.history.append(("AGENT", reply))
         print(f"🤖 [{self.tone}] {reply}")
+        await live_broadcast({
+            "type": "agent_speak", "text": reply, "tone": self.tone,
+        })
         return reply
 
 
@@ -642,7 +675,10 @@ async def deepgram_loop(sess: Session):
 
             if typ == "SpeechStarted":
                 # VAD fired — user is speaking right now
+                was_speaking = sess.ai_speaking
                 await sess.barge_in()
+                if was_speaking:
+                    await live_broadcast({"type": "barge_in"})
 
             elif typ == "Results":
                 alt = data.get("channel", {}).get("alternatives", [{}])[0]
@@ -653,9 +689,17 @@ async def deepgram_loop(sess: Session):
                 if transcript and is_final:
                     pending = (pending + " " + transcript).strip()
 
+                # Push interim transcript to the UI so the user can watch it
+                # form in real time. We send the cumulative (pending + current)
+                # view so partial words aren't lost across Deepgram segments.
+                if transcript and not is_final:
+                    display = (pending + " " + transcript).strip() if pending else transcript
+                    await live_broadcast({"type": "user_interim", "text": display})
+
                 if speech_final and pending:
                     user_text, pending = pending, ""
                     print(f"🎤 USER: {user_text}")
+                    await live_broadcast({"type": "user_final", "text": user_text})
                     reply = await sess.think_and_reply(user_text)
                     await sess.speak(reply)
 
@@ -664,6 +708,7 @@ async def deepgram_loop(sess: Session):
                 if pending:
                     user_text, pending = pending, ""
                     print(f"🎤 USER (utt_end): {user_text}")
+                    await live_broadcast({"type": "user_final", "text": user_text})
                     reply = await sess.think_and_reply(user_text)
                     await sess.speak(reply)
     except Exception as e:
@@ -725,6 +770,26 @@ async def call_stop():
     cleared = list(PENDING)
     PENDING.clear()
     return {"cleared": cleared}
+
+
+@app.websocket("/live")
+async def live(ws: WebSocket):
+    """Frontend subscribes here to receive live transcript + state events."""
+    await ws.accept()
+    LIVE_CLIENTS.add(ws)
+    print(f"👁️  live client connected  ({len(LIVE_CLIENTS)} total)")
+    try:
+        # Keep the socket open. We push from live_broadcast(); any client
+        # message just keeps this receive loop alive so disconnects surface.
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        LIVE_CLIENTS.discard(ws)
+        print(f"👁️  live client left  ({len(LIVE_CLIENTS)} total)")
 
 
 @app.post("/twilio/status")
@@ -850,9 +915,18 @@ async def media(ws: WebSocket):
                     f"🟢 Stream started  sid={sess.stream_sid} "
                     f"call={sess.call_sid} phone={sess.phone}"
                 )
+                await live_broadcast({
+                    "type":       "call_start",
+                    "phone":      sess.phone,
+                    "call_sid":   sess.call_sid,
+                    "stream_sid": sess.stream_sid,
+                })
                 # Keep greeting short — user can barge in and conversation flows faster.
                 greeting = "Hey, this is Alex from AIM. Got a quick second?"
                 sess.history.append(("AGENT", greeting))
+                await live_broadcast({
+                    "type": "agent_speak", "text": greeting, "tone": "neutral",
+                })
                 await sess.speak(greeting, clear_first=False)
 
             elif ev == "media":
@@ -920,6 +994,14 @@ async def media(ws: WebSocket):
                 f"outcome={outcome}  turns={sess.state.get('turns', 0)}  "
                 f"dur={duration:.1f}s  notes={notes!r}"
             )
+            await live_broadcast({
+                "type":         "call_end",
+                "phone":        sess.phone,
+                "outcome":      outcome,
+                "notes":        notes,
+                "duration_sec": round(duration, 2),
+                "final_tone":   sess.tone,
+            })
         except Exception as e:
             print(f"❌ Failed to save outcome: {type(e).__name__}: {e}")
 
