@@ -30,13 +30,16 @@ import json
 import base64
 import asyncio
 import random
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 import websockets
 import google.generativeai as genai
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import Response, JSONResponse
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
@@ -130,6 +133,111 @@ TONE_FALLBACKS = {
     ],
 }
 
+# ========================================================================
+# Persistence — SQLite (calls.db next to server.py)
+# ========================================================================
+DB_PATH = Path(os.getenv("CALLS_DB", "calls.db")).resolve()
+_db_lock = asyncio.Lock()
+
+def _open_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_outcomes (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone          TEXT,
+            call_sid       TEXT,
+            stream_sid     TEXT,
+            outcome        TEXT,       -- purchased | postponed | cancelled | interested | undecided | no_answer
+            final_tone     TEXT,       -- neutral | soft | discount | close
+            interest_score REAL,
+            turns          INTEGER,
+            duration_sec   REAL,
+            transcript     TEXT,       -- full JSON dialogue
+            notes          TEXT,       -- short human-readable summary
+            started_at     TEXT,       -- ISO 8601 UTC
+            ended_at       TEXT        -- ISO 8601 UTC
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phone  ON call_outcomes(phone)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_call   ON call_outcomes(call_sid)")
+    return conn
+
+DB = _open_db()
+print(f"💾 calls DB: {DB_PATH}")
+
+
+async def save_outcome(row: dict) -> int:
+    """Insert a call outcome row, returns the new id."""
+    def _write() -> int:
+        cur = DB.execute("""
+            INSERT INTO call_outcomes
+              (phone, call_sid, stream_sid, outcome, final_tone,
+               interest_score, turns, duration_sec, transcript, notes,
+               started_at, ended_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row.get("phone"), row.get("call_sid"), row.get("stream_sid"),
+            row.get("outcome"), row.get("final_tone"),
+            row.get("interest_score"), row.get("turns"), row.get("duration_sec"),
+            row.get("transcript"), row.get("notes"),
+            row.get("started_at"), row.get("ended_at"),
+        ))
+        return cur.lastrowid
+    async with _db_lock:
+        return await asyncio.to_thread(_write)
+
+
+# Outcome classification — keyword + state-machine driven, no extra LLM calls needed.
+POSTPONE_KWS = (
+    "next month", "next week", "later", "call back", "call me back",
+    "not now", "some other time", "try again", "tomorrow", "next time",
+    "busy right now", "another day",
+)
+CANCEL_KWS = (
+    "cancel", "not interested", "stop calling", "don't call", "do not call",
+    "remove me", "unsubscribe", "never call", "leave me alone",
+)
+PURCHASE_KWS = (
+    "yes renew", "go ahead", "sign me up", "i'll take it", "let's do it",
+    "lets do it", "do it", "please renew", "i want to renew", "i'd like to renew",
+    "renew it", "confirm", "i'll pay", "send the link", "send me the link",
+)
+
+def classify_outcome(history, state, final_tone):
+    """
+    Returns (outcome, notes).
+    Priority: cancel > postpone > purchase/close > interested > undecided > no_answer.
+    """
+    user_turns = [c for r, c in history if r == "USER"]
+    if not user_turns:
+        return "no_answer", "Call connected but no user speech was captured"
+
+    all_user = " ".join(user_turns).lower()
+
+    # Cancel beats everything — we want to respect a clear "no".
+    if any(k in all_user for k in CANCEL_KWS):
+        return "cancelled", "User explicitly declined / asked not to be contacted"
+
+    # Then postpone — user said "call me later / next month".
+    if any(k in all_user for k in POSTPONE_KWS):
+        return "postponed", "User asked to be contacted at a later time"
+
+    # Then purchase signals (strong intent OR close-tone + high interest).
+    if any(k in all_user for k in PURCHASE_KWS):
+        return "purchased", "User agreed to renew"
+    if final_tone == "close" and state.get("interest", 0) >= 2.0:
+        return "purchased", "Agent reached close state with high interest"
+
+    if state.get("interest", 0) >= 1.0:
+        return "interested", "Positive sentiment but no firm commitment"
+
+    if state.get("interest", 0) <= -1.0:
+        return "cancelled", "Negative sentiment throughout the call"
+
+    return "undecided", "Call ended without a clear outcome"
+
+
 YES_KEYWORDS   = ("yes", "sure", "renew", "ok let", "okay let", "sign me", "i'll take",
                   "go ahead", "do it", "please do", "sounds good", "lets do", "let's do")
 NO_KEYWORDS    = ("not interested", "stop calling", "don't call", "leave me alone",
@@ -172,6 +280,10 @@ class Session:
     def __init__(self, twilio_ws: WebSocket):
         self.twilio_ws   = twilio_ws
         self.stream_sid  = None
+        self.call_sid    = None
+        self.phone       = None          # +91XXXXXXXXXX (the callee)
+        self.started_at  = None          # datetime (UTC)
+        self.start_ts    = None          # monotonic seconds for duration
         self.dg_ws       = None          # deepgram websocket
         self.history     = []            # [(role, text), ...]
         self.state       = {"interest": 0.0, "frustration": 0, "sentiment": 0.0, "turns": 0}
@@ -427,14 +539,70 @@ async def deepgram_loop(sess: Session):
 # HTTP: TwiML that opens the bidirectional stream
 # ========================================================================
 @app.post("/voice")
-async def voice():
+async def voice(request: Request):
+    """
+    Returns TwiML that opens the bidirectional stream.
+    Accepts `?to=+91...` so agent.py can tell us which number we're calling;
+    Twilio echoes Parameter values back on the `start` event.
+    """
+    form = await request.form()
+    to_number = request.query_params.get("to") or form.get("To") or ""
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{WSS_URL}" />
+        <Stream url="{WSS_URL}">
+            <Parameter name="to" value="{to_number}"/>
+        </Stream>
     </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
+
+
+# ------------------------------------------------------------------------
+# Query endpoints for stored outcomes
+# ------------------------------------------------------------------------
+@app.get("/calls")
+async def list_calls(phone: str | None = None, limit: int = 50):
+    """GET /calls?phone=+91XXXX&limit=20 — latest outcomes, newest first."""
+    def _q():
+        cur = DB.cursor()
+        if phone:
+            cur.execute(
+                "SELECT * FROM call_outcomes WHERE phone = ? "
+                "ORDER BY id DESC LIMIT ?", (phone, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM call_outcomes ORDER BY id DESC LIMIT ?", (limit,),
+            )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    rows = await asyncio.to_thread(_q)
+    return JSONResponse(rows)
+
+
+@app.get("/calls/summary")
+async def calls_summary():
+    """Counts of each outcome, plus per-phone latest status."""
+    def _q():
+        cur = DB.cursor()
+        cur.execute(
+            "SELECT outcome, COUNT(*) FROM call_outcomes GROUP BY outcome"
+        )
+        by_outcome = {row[0]: row[1] for row in cur.fetchall()}
+
+        cur.execute("""
+            SELECT phone, outcome, ended_at
+            FROM call_outcomes
+            WHERE id IN (SELECT MAX(id) FROM call_outcomes GROUP BY phone)
+            ORDER BY ended_at DESC
+        """)
+        latest = [
+            {"phone": r[0], "outcome": r[1], "ended_at": r[2]}
+            for r in cur.fetchall()
+        ]
+        return {"by_outcome": by_outcome, "latest_per_phone": latest}
+    return JSONResponse(await asyncio.to_thread(_q))
 
 
 # ========================================================================
@@ -465,8 +633,17 @@ async def media(ws: WebSocket):
                 print("🔌 Twilio connected")
 
             elif ev == "start":
-                sess.stream_sid = data["start"]["streamSid"]
-                print(f"🟢 Stream started  sid={sess.stream_sid}")
+                start_info = data["start"]
+                sess.stream_sid = start_info["streamSid"]
+                sess.call_sid   = start_info.get("callSid")
+                cust = start_info.get("customParameters") or {}
+                sess.phone = cust.get("to") or "unknown"
+                sess.started_at = datetime.now(timezone.utc)
+                sess.start_ts   = asyncio.get_event_loop().time()
+                print(
+                    f"🟢 Stream started  sid={sess.stream_sid} "
+                    f"call={sess.call_sid} phone={sess.phone}"
+                )
                 # Keep greeting short — user can barge in and conversation flows faster.
                 greeting = "Hey, this is Alex from AIM. Got a quick second?"
                 sess.history.append(("AGENT", greeting))
@@ -505,4 +682,39 @@ async def media(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+
+        # ---------- Persist the outcome ----------
+        try:
+            ended_at = datetime.now(timezone.utc)
+            duration = (
+                asyncio.get_event_loop().time() - sess.start_ts
+                if sess.start_ts else 0.0
+            )
+            outcome, notes = classify_outcome(sess.history, sess.state, sess.tone)
+            transcript_json = json.dumps(
+                [{"role": r, "text": c} for r, c in sess.history],
+                ensure_ascii=False,
+            )
+            row_id = await save_outcome({
+                "phone":          sess.phone or "unknown",
+                "call_sid":       sess.call_sid,
+                "stream_sid":     sess.stream_sid,
+                "outcome":        outcome,
+                "final_tone":     sess.tone,
+                "interest_score": round(sess.state.get("interest", 0.0), 3),
+                "turns":          sess.state.get("turns", 0),
+                "duration_sec":   round(duration, 2),
+                "transcript":     transcript_json,
+                "notes":          notes,
+                "started_at":     sess.started_at.isoformat() if sess.started_at else None,
+                "ended_at":       ended_at.isoformat(),
+            })
+            print(
+                f"💾 outcome saved  id={row_id}  phone={sess.phone} "
+                f"outcome={outcome}  turns={sess.state.get('turns', 0)}  "
+                f"dur={duration:.1f}s  notes={notes!r}"
+            )
+        except Exception as e:
+            print(f"❌ Failed to save outcome: {type(e).__name__}: {e}")
+
         print("🧹 Session cleaned up")

@@ -13,6 +13,7 @@
 
 import os
 import sys
+from urllib.parse import quote
 from twilio.rest import Client
 from dotenv import load_dotenv
 
@@ -36,12 +37,14 @@ def main():
     to_number = sys.argv[1].strip()
 
     client = Client(TWILIO_SID, TWILIO_AUTH)
+    # Pass the target number as a query param so /voice can embed it in the
+    # <Stream> <Parameter> — the server uses it to persist the call outcome.
+    voice_url = f"{BASE_URL}/voice?to={quote(to_number)}"
     call = client.calls.create(
         to=to_number,
         from_=TWILIO_PHONE,
-        url=f"{BASE_URL}/voice",
+        url=voice_url,
         method="POST",
-        # Let the callee hear the stream start fast:
         record=False,
     )
     print(f"✅ Call started: SID={call.sid}  to={to_number}")

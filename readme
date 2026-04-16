@@ -2,13 +2,16 @@ Open Anaconda Prompt
 conda activate MajorProject
 
 Terminal 1 -
-uvicorn server:app --port 5000
+uvicorn server:app --host 0.0.0.0 --port 8000
 
 Terminal 2 - 
 python agent.py +919121795950
 
 Terminal 3 - 
-ngrok http 5000
+ngrok http 8000
 
 Last Step - 
 Copy the ngrok url in .env
+
+To Check the DB
+sqlite3 calls.db "SELECT phone, outcome, notes, ended_at FROM call_outcomes ORDER BY id DESC;"
