@@ -33,15 +33,17 @@ import random
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 import websockets
 import google.generativeai as genai
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, HTMLResponse
 from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from twilio.rest import Client as TwilioClient
 
 load_dotenv()
 
@@ -50,6 +52,9 @@ ELEVEN_API_KEY   = os.getenv("ELEVEN_API_KEY")
 ELEVEN_VOICE_ID  = os.getenv("ELEVEN_VOICE_ID")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 BASE_URL         = os.getenv("BASE_URL", "").rstrip("/")
+TWILIO_SID       = os.getenv("TWILIO_SID")
+TWILIO_AUTH      = os.getenv("TWILIO_AUTH")
+TWILIO_PHONE     = os.getenv("TWILIO_PHONE")
 
 # Derive the wss:// URL Twilio will dial
 WSS_URL = (
@@ -236,6 +241,136 @@ def classify_outcome(history, state, final_tone):
         return "cancelled", "Negative sentiment throughout the call"
 
     return "undecided", "Call ended without a clear outcome"
+
+
+# ========================================================================
+# Sequential call queue — dials one number at a time, waits for the call to
+# end (via Twilio's statusCallback) before dialing the next.
+# ========================================================================
+PENDING: list[str] = []           # numbers not yet dialed
+PENDING_EVENT = asyncio.Event()   # set when a new number is queued
+CURRENT_CALL = {
+    "number":     None,
+    "call_sid":   None,
+    "status":     "idle",         # idle | dialing | in_progress | ended | failed
+    "started_at": None,
+}
+CALL_DONE_EVENT: asyncio.Event | None = None   # reset per call
+WORKER_TASK: asyncio.Task | None = None
+WORKER_STOP = False
+
+_twilio_client: TwilioClient | None = None
+def twilio():
+    global _twilio_client
+    if _twilio_client is None:
+        if not (TWILIO_SID and TWILIO_AUTH):
+            raise RuntimeError("TWILIO_SID / TWILIO_AUTH not set in .env")
+        _twilio_client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
+    return _twilio_client
+
+
+def _normalize_number(raw: str) -> str:
+    """Keep leading + and digits only."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    keep = "+" + re.sub(r"\D", "", raw) if raw.startswith("+") else re.sub(r"\D", "", raw)
+    return keep
+
+
+async def _dial(number: str) -> str | None:
+    """Place the Twilio outbound call. Returns call SID or None on failure."""
+    voice_url  = f"{BASE_URL}/voice?to={quote(number)}"
+    status_url = f"{BASE_URL}/twilio/status"
+    def _create():
+        return twilio().calls.create(
+            to=number,
+            from_=TWILIO_PHONE,
+            url=voice_url,
+            method="POST",
+            status_callback=status_url,
+            status_callback_method="POST",
+            status_callback_event=["initiated", "ringing", "answered",
+                                    "completed", "failed", "busy",
+                                    "no-answer", "canceled"],
+            record=False,
+        )
+    try:
+        call = await asyncio.to_thread(_create)
+        return call.sid
+    except Exception as e:
+        print(f"❌ Twilio dial failed for {number}: {e}")
+        return None
+
+
+async def call_worker():
+    """Pulls numbers off PENDING one at a time and dials them sequentially."""
+    global CALL_DONE_EVENT
+    print("👷 call_worker started")
+    while not WORKER_STOP:
+        # wait until there's something to dial
+        if not PENDING:
+            CURRENT_CALL["status"] = "idle"
+            CURRENT_CALL["number"] = None
+            CURRENT_CALL["call_sid"] = None
+            try:
+                await asyncio.wait_for(PENDING_EVENT.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                continue
+            PENDING_EVENT.clear()
+            if WORKER_STOP:
+                break
+            continue
+
+        number = PENDING.pop(0)
+        CALL_DONE_EVENT = asyncio.Event()
+        CURRENT_CALL.update({
+            "number":     number,
+            "call_sid":   None,
+            "status":     "dialing",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+        print(f"📞 Dialing {number}  ({len(PENDING)} left in queue)")
+
+        sid = await _dial(number)
+        if not sid:
+            CURRENT_CALL["status"] = "failed"
+            # also write a row so the UI shows the failure
+            try:
+                await save_outcome({
+                    "phone": number, "call_sid": None, "stream_sid": None,
+                    "outcome": "no_answer", "final_tone": "neutral",
+                    "interest_score": 0.0, "turns": 0, "duration_sec": 0.0,
+                    "transcript": "[]", "notes": "Twilio dial failed (unreachable / invalid)",
+                    "started_at": CURRENT_CALL["started_at"],
+                    "ended_at":   datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+            continue
+
+        CURRENT_CALL["call_sid"] = sid
+        CURRENT_CALL["status"]   = "in_progress"
+
+        # Wait for Twilio's status webhook to signal the call ended.
+        try:
+            await asyncio.wait_for(CALL_DONE_EVENT.wait(), timeout=600)  # 10 min cap
+        except asyncio.TimeoutError:
+            print(f"⏰ Call {sid} timed out waiting for status webhook")
+
+        CURRENT_CALL["status"] = "ended"
+        print(f"✓ Call finished: {number}  sid={sid}")
+        # tiny pause between calls
+        await asyncio.sleep(2.0)
+    print("👷 call_worker exited")
+
+
+def _ensure_worker():
+    global WORKER_TASK, WORKER_STOP
+    WORKER_STOP = False
+    if WORKER_TASK is None or WORKER_TASK.done():
+        WORKER_TASK = asyncio.create_task(call_worker())
 
 
 YES_KEYWORDS   = ("yes", "sure", "renew", "ok let", "okay let", "sign me", "i'll take",
@@ -538,6 +673,77 @@ async def deepgram_loop(sess: Session):
 # ========================================================================
 # HTTP: TwiML that opens the bidirectional stream
 # ========================================================================
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    path = Path(__file__).parent / "index.html"
+    if not path.exists():
+        return HTMLResponse("<h1>index.html missing</h1>", status_code=500)
+    return HTMLResponse(path.read_text(encoding="utf-8"))
+
+
+@app.post("/call")
+async def call_enqueue(request: Request):
+    """
+    Queue one or more numbers for sequential dialing.
+    Body: {"numbers": ["+91XXXXXXXXXX", ...]}  or  {"number": "+91..."}
+    """
+    body = await request.json()
+    raw = body.get("numbers") or body.get("number") or []
+    if isinstance(raw, str):
+        raw = [raw]
+
+    cleaned, rejected = [], []
+    for n in raw:
+        norm = _normalize_number(n)
+        if norm and len(re.sub(r"\D", "", norm)) >= 8:
+            cleaned.append(norm)
+        else:
+            rejected.append(n)
+
+    for n in cleaned:
+        PENDING.append(n)
+    if cleaned:
+        PENDING_EVENT.set()
+        _ensure_worker()
+
+    return {"queued": cleaned, "rejected": rejected, "pending": list(PENDING)}
+
+
+@app.get("/call/status")
+async def call_status():
+    return {
+        "current": dict(CURRENT_CALL),
+        "pending": list(PENDING),
+        "pending_count": len(PENDING),
+        "worker_running": WORKER_TASK is not None and not WORKER_TASK.done(),
+    }
+
+
+@app.post("/call/stop")
+async def call_stop():
+    """Clear pending queue. Does NOT hang up the active call."""
+    cleared = list(PENDING)
+    PENDING.clear()
+    return {"cleared": cleared}
+
+
+@app.post("/twilio/status")
+async def twilio_status(request: Request):
+    """
+    Twilio pings this for each call state transition. We use the terminal
+    states to unblock the call worker so it can dial the next number.
+    """
+    form = await request.form()
+    call_sid  = form.get("CallSid")
+    status    = (form.get("CallStatus") or "").lower()
+    duration  = form.get("CallDuration")
+    print(f"📡 Twilio status  sid={call_sid}  status={status}  dur={duration}")
+    if status in {"completed", "failed", "busy", "no-answer", "canceled"}:
+        if CALL_DONE_EVENT and not CALL_DONE_EVENT.is_set():
+            CALL_DONE_EVENT.set()
+    return Response(content="", media_type="text/plain")
+
+
 @app.post("/voice")
 async def voice(request: Request):
     """
