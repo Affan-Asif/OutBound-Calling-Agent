@@ -1,0 +1,14 @@
+Open Anaconda Prompt
+conda activate MajorProject
+
+Terminal 1 -
+uvicorn server:app --port 5000
+
+Terminal 2 - 
+python agent.py +919121795950
+
+Terminal 3 - 
+ngrok http 5000
+
+Last Step - 
+Copy the ngrok url in .env
