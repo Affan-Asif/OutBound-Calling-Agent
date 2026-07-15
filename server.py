@@ -65,7 +65,7 @@ WSS_URL = (
 genai.configure(api_key=GEMINI_API_KEY)
 # gemini-2.5-flash-lite has ~15 RPM on the free tier vs ~5 for gemini-2.5-flash.
 # Latency is similar and quality is fine for short 1-2 sentence sales replies.
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI = genai.GenerativeModel(GEMINI_MODEL_NAME)
 VADER  = SentimentIntensityAnalyzer()
 
