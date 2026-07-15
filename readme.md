@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/3e754f61-befa-47cd-9ec7-e522da84db95
+
 Open Anaconda Prompt
 conda activate MajorProject
 
